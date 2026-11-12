@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Monitor</title>
+<style>html,body{margin:0;height:100%;background:#000}
+#s{position:relative;height:100%;aspect-ratio:var(--a,1.333);margin:auto;background:url(/reference) center/100% 100%}
+.d{position:absolute;width:6vmin;height:6vmin;margin:-3vmin;border-radius:50%;background:#fffa;box-shadow:0 0 4vmin 2vmin #fff8;transition:left .05s,top .05s}</style>
+<div id="s"></div>
+<script>
+const s=document.getElementById('s'),dots={};
+fetch('/config.json').then(r=>r.json()).then(async c=>{const i=new Image();i.src='/reference';await i.decode();
+  s.style.setProperty('--a',c.aspect||i.naturalWidth/i.naturalHeight)});
+(function c(){const w=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/monitor');
+  w.onmessage=e=>{const m=JSON.parse(e.data);let d=dots[m.id];
+    if(!d){d=dots[m.id]=document.createElement('div');d.className='d';s.append(d)}
+    d.style.left=m.x*100+'%';d.style.top=m.y*100+'%';d.style.opacity=.3+m.c*.7;
+    clearTimeout(d.t);d.t=setTimeout(()=>{d.remove();delete dots[m.id]},1500)};
+  w.onclose=()=>setTimeout(c,1000)})();
+</script>

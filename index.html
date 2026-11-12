@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Stargazing Tracker</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#cfe;font:14px system-ui}
+video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#hud{position:absolute;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top,0px) + 8px) 12px;text-shadow:0 0 4px #000;white-space:pre}
+#go{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:16px 28px;font-size:18px;border:0;border-radius:12px;background:#6cf}
+</style></head><body>
+<video id="v" playsinline muted></video><canvas id="o"></canvas>
+<div id="hud">พร้อมเริ่ม</div><button id="go">เริ่มกล้อง</button>
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'),o=$('o'),ctx=o.getContext('2d'),hud=$('hud');
+const off=document.createElement('canvas'),octx=off.getContext('2d',{willReadFrequently:true});
+const SMIN=0.0004,SMAX=0.012,GS=0.04; // scale range: ref-units per camera pixel
+let W=320,H=240,A=16/9,R=[],KNN=[],grid=new Map(),T=null,ws;
+const id=Math.random().toString(36).slice(2,6);
+
+// One Euro filter (smooth when slow, responsive when fast)
+function OE(minc=1.5,beta=8){let px,pdx=0,pt;const al=(c,dt)=>{const r=6.283*c*dt;return r/(r+1)};
+  return (x,t)=>{if(px===undefined){px=x;pt=t;return x}const dt=Math.max(1e-3,(t-pt)/1000);
+    pdx+=al(1,dt)*((x-px)/dt-pdx);px+=al(minc+beta*Math.abs(pdx),dt)*(x-px);pt=t;return px}}
+const fx=OE(),fy=OE();
+
+// reference star index
+const key=(x,y)=>(Math.floor(x/GS)+8)*256+Math.floor(y/GS)+8;
+function build(j){A=j.aspect;R=j.stars;grid.clear();
+  R.forEach((s,i)=>{const k=key(s[0],s[1]);if(!grid.has(k))grid.set(k,[]);grid.get(k).push(i)});
+  KNN=R.map((s,i)=>R.map((t,k)=>[k,(s[0]-t[0])**2+(s[1]-t[1])**2]).sort((a,b)=>a[1]-b[1]).slice(1,5).map(e=>e[0]))}
+function nearest(x,y,tol){let b=-1,bd=tol*tol;const cx=Math.floor(x/GS),cy=Math.floor(y/GS);
+  for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++){const c=grid.get((cx+i+8)*256+cy+j+8);
+    if(c)for(const k of c){const d=(R[k][0]-x)**2+(R[k][1]-y)**2;if(d<bd){bd=d;b=k}}}
+  return b}
+
+// similarity transform: camera px -> screen ref coords
+const ap=(T,p)=>[T.a*p[0]-T.b*p[1]+T.tx,T.b*p[0]+T.a*p[1]+T.ty];
+function fit(m){const n=m.length;let mx=0,my=0,qx=0,qy=0;
+  for(const e of m){mx+=e[0];my+=e[1];qx+=e[2];qy+=e[3]}mx/=n;my/=n;qx/=n;qy/=n;
+  let re=0,im=0,nn=0;
+  for(const e of m){const px=e[0]-mx,py=e[1]-my,X=e[2]-qx,Y=e[3]-qy;re+=px*X+py*Y;im+=px*Y-py*X;nn+=px*px+py*py}
+  if(nn<1e-6)return null;const a=re/nn,b=im/nn;
+  return{a,b,tx:qx-(a*mx-b*my),ty:qy-(b*mx+a*my)}}
+function matches(T,pts){const s=Math.hypot(T.a,T.b),tol=Math.min(4*s,GS),out=[],used=new Set();
+  for(const p of pts){const q=ap(T,p),k=nearest(q[0],q[1],tol);
+    if(k>=0&&!used.has(k)){used.add(k);out.push([p[0],p[1],R[k][0],R[k][1]])}}
+  return out}
+
+// grayscale -> star blobs by local contrast (works on gradient backgrounds, big and small stars)
+function box(g,W,H,r){const I=new Float32Array((W+1)*(H+1));
+  for(let y=0;y<H;y++){let s=0;for(let x=0;x<W;x++){s+=g[y*W+x];I[(y+1)*(W+1)+x+1]=I[y*(W+1)+x+1]+s}}
+  const o=new Float32Array(W*H);
+  for(let y=0;y<H;y++){const y0=Math.max(0,y-r),y1=Math.min(H,y+r+1);
+    for(let x=0;x<W;x++){const x0=Math.max(0,x-r),x1=Math.min(W,x+r+1);
+      o[y*W+x]=(I[y1*(W+1)+x1]-I[y0*(W+1)+x1]-I[y1*(W+1)+x0]+I[y0*(W+1)+x0])/((x1-x0)*(y1-y0))}}
+  return o}
+function blobs(g,W,H,maxN,sep,k){const b1=box(g,W,H,5),b2=box(g,W,H,15),d=new Float32Array(W*H);let s=0,s2=0;
+  for(let i=0;i<W*H;i++){d[i]=Math.max(g[i]-b1[i],g[i]-b2[i]);s+=d[i];s2+=d[i]*d[i]}
+  const m=s/(W*H),sd=Math.sqrt(Math.max(0,s2/(W*H)-m*m)),th=Math.max(m+k*sd,14),pts=[];
+  for(let y=3;y<H-3;y++)for(let x=3;x<W-3;x++){const i=y*W+x,p=d[i];if(p<th)continue;
+    let ok=true;for(let dy=-2;dy<=2&&ok;dy++)for(let dx=-2;dx<=2;dx++)if((dx||dy)&&d[i+dy*W+dx]>p){ok=false;break}
+    if(!ok)continue;let sw=0,sx=0,sy=0;
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const w=Math.max(0,d[i+dy*W+dx]);sw+=w;sx+=w*(x+dx);sy+=w*(y+dy)}
+    if(sw>0)pts.push([sx/sw,sy/sw,p])}
+  pts.sort((a,b)=>b[2]-a[2]);const out=[];
+  for(const p of pts){if(out.every(q=>Math.hypot(q[0]-p[0],q[1]-p[1])>sep))out.push(p);if(out.length>=maxN)break}
+  return out}
+function gray(d,N){const g=new Float32Array(N);for(let i=0;i<N;i++)g[i]=.299*d[i*4]+.587*d[i*4+1]+.114*d[i*4+2];return g}
+function detect(){octx.drawImage(v,0,0,W,H);return blobs(gray(octx.getImageData(0,0,W,H).data,W*H),W,H,40,5,3)}
+
+// build the reference star list from /reference (swap reference.jpg on the server to change the graphic)
+async function loadRef(){
+  const cfg=await (await fetch('/config.json')).json(),img=new Image();
+  img.src='/reference?'+Date.now();await img.decode();
+  const RW=800,RH=Math.round(RW*img.naturalHeight/img.naturalWidth),c=document.createElement('canvas');
+  c.width=RW;c.height=RH;const cx=c.getContext('2d',{willReadFrequently:true});cx.drawImage(img,0,0,RW,RH);
+  const a=cfg.aspect||img.naturalWidth/img.naturalHeight;
+  const pts=blobs(gray(cx.getImageData(0,0,RW,RH).data,RW*RH),RW,RH,600,6,3);
+  build({aspect:a,stars:pts.map(p=>[p[0]/RW*a,p[1]/RH])})}
+
+// global search when tracking is lost: try seed pairs against reference neighbour pairs
+function acquire(pts){if(pts.length<6)return null;let best=null,bn=0;
+  for(let a=0;a<Math.min(6,pts.length);a++){const p0=pts[a];
+    const nb=pts.map((p,i)=>[i,Math.hypot(p[0]-p0[0],p[1]-p0[1])]).filter(e=>e[0]!==a&&e[1]>12).sort((x,y)=>x[1]-y[1]).slice(0,3);
+    if(nb.length<2)continue;
+    nb.forEach(([bi,dpx],ni)=>{const p1=pts[bi],chk=pts[nb[(ni+1)%nb.length][0]];
+      for(let i=0;i<R.length;i++)for(const j of KNN[i]){
+        const s=Math.hypot(R[i][0]-R[j][0],R[i][1]-R[j][1])/dpx;if(s<SMIN||s>SMAX)continue;
+        const t=fit([[p0[0],p0[1],R[i][0],R[i][1]],[p1[0],p1[1],R[j][0],R[j][1]]]);if(!t)continue;
+        const q=ap(t,chk);if(nearest(q[0],q[1],5*s)<0)continue; // quick 3rd-point check
+        const n=matches(t,pts).length;if(n>bn){bn=n;best=t}}})}
+  return bn>=6&&bn>=0.4*pts.length?best:null}
+
+function conn(){ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+  ws.onclose=()=>setTimeout(conn,1000)}
+
+function loop(t){requestAnimationFrame(loop);if(v.readyState<2||!R.length)return;
+  const pts=detect();let m=[];
+  if(T){m=matches(T,pts);
+    for(let k=0;k<2&&m.length>=4;k++){const T2=fit(m);if(!T2)break;T=T2;m=matches(T,pts)}
+    const s=T?Math.hypot(T.a,T.b):0;if(m.length<5||s<SMIN||s>SMAX){T=null;m=[]}}
+  if(!T){T=acquire(pts);if(T)m=matches(T,pts)}
+  ctx.clearRect(0,0,W,H);ctx.lineWidth=1;
+  ctx.strokeStyle='#4f4';pts.forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],5,0,7);ctx.stroke()});
+  ctx.strokeStyle='#fd0';m.forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],8,0,7);ctx.stroke()});
+  ctx.strokeStyle='#fff';ctx.beginPath();ctx.moveTo(W/2-10,H/2);ctx.lineTo(W/2+10,H/2);ctx.moveTo(W/2,H/2-10);ctx.lineTo(W/2,H/2+10);ctx.stroke();
+  if(T){const c=ap(T,[W/2,H/2]),cl=x=>Math.max(0,Math.min(1,x));
+    const x=fx(cl(c[0]/A),t),y=fy(cl(c[1]),t),conf=Math.min(1,m.length/12);
+    if(ws&&ws.readyState===1)ws.send(JSON.stringify({id,x:+x.toFixed(4),y:+y.toFixed(4),c:+conf.toFixed(2)}));
+    hud.textContent=`X ${x.toFixed(3)}  Y ${y.toFixed(3)}\nติดตาม: ${m.length}/${pts.length} ดวง  conf ${conf.toFixed(2)}`;
+  }else hud.textContent=`กำลังหาตำแหน่ง… (เจอดาว ${pts.length} ดวง)\nหันกล้องไปที่จอ ให้เห็นดาวหลายดวง`}
+
+$('go').onclick=async()=>{
+  try{const st=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:'environment',width:{ideal:640},height:{ideal:480},frameRate:{ideal:30}}});
+    v.srcObject=st;await v.play();
+    try{await st.getVideoTracks()[0].applyConstraints({advanced:[{exposureMode:'manual',exposureCompensation:-2}]})}catch(e){} // Android Chrome only
+    W=320;H=Math.round(320*v.videoHeight/v.videoWidth);off.width=o.width=W;off.height=o.height=H;
+    hud.textContent='กำลังอ่านภาพอ้างอิง…';await loadRef();conn();$('go').remove();requestAnimationFrame(loop)
+  }catch(e){hud.textContent='เปิดกล้องไม่ได้: '+e.message+'\n(ต้องใช้ HTTPS)'}};
+</script></body></html>
